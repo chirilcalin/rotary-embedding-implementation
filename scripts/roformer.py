@@ -39,6 +39,37 @@ weight_decay = 1e-2
 model_cfg = Config(debug=False, d_model=256, n_heads=4, d_head=64, d_mlp=1024, n_layers=2, n_ctx=256, d_vocab=reference_gpt2.cfg.d_vocab)
 
 
+class RotaryOperation():
+
+    def precompute_theta_position_frequencies(head_dim : int, seq_len : int , device : str, theta : float = 10000.0):
+    
+        assert head_dim % 2 == 0
+    
+        theta_numerator = torch.arange(0, head_dim, 2).float() 
+        theta = 1.0 / (theta ** (theta_numerator / head_dim )).to(device) 
+        m = torch.arange(seq_len, device=device)
+    
+        freqs = torch.outer(m, theta).float()     
+    
+        freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_complex
+
+
+    def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
+
+        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1],-1, 2)) 
+    
+        freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2) 
+    
+        x_rotated = x_complex * freqs_complex
+    
+        x_out = torch.view_as_real(x_rotated)
+        x_out = x_out.reshape(*x.shape)
+        return x_out.type_as(x).to(device)
+
+
+
+
 class LayerNorm(nn.Module):
     def __init__(self, cfg):
         super().__init__()
