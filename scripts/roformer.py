@@ -137,6 +137,7 @@ class RopeAttention(nn.Module):
     def forward(self, normalized_resid_pre):
         # normalized_resid_pre: [batch, position, d_model]
 
+        #Initializing our real + complex frequencies so that we are able to apply relative positional information to our Q and K matrices 
         freqs_complex = precompute_theta_position_frequencies(self.cfg.d_head, normalized_resid_pre.shape[1], "cuda", 10000)
 
         
