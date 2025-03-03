@@ -99,19 +99,17 @@ class Embed(nn.Module):
 
     def forward(self, tokens):
         # tokens: [batch, position]
-        
 
+        allBatches = []
+        for batch in tokens:
+            oneBatch = [(self.W_E[t]) for t in batch]
+            oneBatch = torch.stack(oneBatch)
+            allBatches.append(oneBatch)
 
-        boon = []
-        for z in tokens:
-            zoon = [(self.W_E[x]) for x in z]
-            zoon = torch.stack(zoon)
-            boon.append(zoon)
+        allBatches = torch.stack(allBatches)
 
-        boon = torch.stack(boon)
+        return allBatches
 
-
-        return boon
 
 
 class RopeAttention(nn.Module):
@@ -132,30 +130,31 @@ class RopeAttention(nn.Module):
         nn.init.normal_(self.W_O, std=self.cfg.init_range)
         self.b_O = nn.Parameter(torch.zeros((cfg.d_model)))
 
+        self.f_C = None
+
         self.register_buffer("IGNORE", torch.tensor(-1e5, dtype=torch.float32, device="cuda"))
+
+    
 
     def forward(self, normalized_resid_pre):
         # normalized_resid_pre: [batch, position, d_model]
-
-        #Initializing our real + complex frequencies so that we are able to apply relative positional information to our Q and K matrices 
-        freqs_complex = precompute_theta_position_frequencies(self.cfg.d_head, normalized_resid_pre.shape[1], "cuda", 10000)
-
         
         Q=einops.einsum(normalized_resid_pre, self.W_Q, 'b t c, n_heads c d_head -> b t n_heads d_head ') + self.b_Q
         K=einops.einsum(normalized_resid_pre, self.W_K, 'b t c, n_heads c d_head -> b t n_heads d_head ') + self.b_K
         V=einops.einsum(normalized_resid_pre, self.W_V, 'b t c, n_heads c d_head -> b t n_heads d_head ') + self.b_V
 
-        Q=apply_rotary_embeddings(Q, freqs_complex, "cuda")
-        K=apply_rotary_embeddings(K, freqs_complex, "cuda")
+        Q=apply_rotary_embeddings(Q, self.f_C, "cuda")
+        K=apply_rotary_embeddings(K, self.f_C, "cuda")
         
-        zing = einops.einsum(Q, K, 'batch q n_head d_head, batch k n_head d_head -> batch n_head q k')  
-        zing = zing / math.sqrt(cfg.d_head)
-        masked = self.apply_causal_mask(zing)
-        soft = nn.Softmax(dim=3)
-        softer=soft(masked)
-        maskedV = einops.einsum(softer, V, 'batch n_head qindex kindex, batch kindex n_head d_head -> batch qindex n_head d_head') 
-        zolder =  einops.einsum(maskedV, self.W_O, 'batch qindex n_head d_head, n_head d_head d_model -> batch qindex d_model') + self.b_O 
-        return zolder
+        qk_circuit = einops.einsum(Q, K, 'batch q n_head d_head, batch k n_head d_head -> batch n_head q k')
+        qk_circuit = qk_circuit / math.sqrt(cfg.d_head)
+        
+        masked = self.apply_causal_mask(qk_circuit)
+        softmax = nn.Softmax(dim=3)
+        soft = softmax(masked)
+        maskedValues = einops.einsum(soft, V, 'batch n_head qindex kindex, batch kindex n_head d_head -> batch qindex n_head d_head') 
+        outmatrix =  einops.einsum(maskedValues, self.W_O, 'batch qindex n_head d_head, n_head d_head d_model -> batch qindex d_model') + self.b_O 
+        return outmatrix
         
 
     def apply_causal_mask(self, attn_scores):
@@ -163,7 +162,6 @@ class RopeAttention(nn.Module):
         updated = torch.tril(attn_scores)
         updated[updated==0] = float('-inf')
         return updated
-
 
 
 class MLP(nn.Module):
@@ -180,15 +178,13 @@ class MLP(nn.Module):
     def forward(self, normalized_resid_mid):
         # normalized_resid_mid: [batch, position, d_model]
 
-
-        one1=normalized_resid_mid@self.W_in + self.b_in
-        one=einops.einsum(normalized_resid_mid, self.W_in, 'b t c, c d_mlp -> b t d_mlp') + self.b_in
+        combineScale = einops.einsum(normalized_resid_mid, self.W_in, 'b t c, c d_mlp -> b t d_mlp') + self.b_in
         gelu = nn.GELU(approximate='tanh')
-        two=gelu(one)
-        three = einops.einsum(two, self.W_out, 'b t d_mlp, d_mlp c -> b t c') + self.b_out
+        geluOutput = gelu(combineScale)
+        combineScaleLoss = einops.einsum(geluOutput, self.W_out, 'b t d_mlp, d_mlp c -> b t c') + self.b_out
         
 
-        return three
+        return combineScaleLoss
 
 
 class RopeBlock(nn.Module):
