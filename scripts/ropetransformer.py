@@ -6,68 +6,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from easy_transformer.utils import get_corner, gelu_new, tokenize_and_concatenate
+from easy_transformer.utils import tokenize_and_concatenate
 import tqdm.auto as tqdm
-
-
-#this script is the main transformer big thing
-
-reference_gpt2 = EasyTransformer.from_pretrained("gpt2-small", fold_ln=False, center_unembed=False, center_writing_weights=False)
-
-@dataclass
-class Config:
-    d_model: int = 768
-    debug: bool = True
-    layer_norm_eps: float = 1e-5
-    d_vocab: int = 50257
-    init_range: float = 0.02
-    n_ctx: int = 1024
-    d_head: int = 64
-    d_mlp: int = 3072
-    n_heads: int = 12
-    n_layers: int = 12
-
-cfg = Config()
-
-
-batch_size = 8
-num_epochs = 1
-max_steps = 1000
-log_every = 10
-lr = 1e-3
-weight_decay = 1e-2
-model_cfg = Config(debug=False, d_model=256, n_heads=4, d_head=64, d_mlp=1024, n_layers=2, n_ctx=256, d_vocab=reference_gpt2.cfg.d_vocab)
-
-
-class RotaryOperation():
-
-    def precompute_theta_position_frequencies(head_dim : int, seq_len : int , device : str, theta : float = 10000.0):
-    
-        assert head_dim % 2 == 0
-    
-        theta_numerator = torch.arange(0, head_dim, 2).float() 
-        theta = 1.0 / (theta ** (theta_numerator / head_dim )).to(device) 
-        m = torch.arange(seq_len, device=device)
-    
-        freqs = torch.outer(m, theta).float()     
-    
-        freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs_complex
-
-
-    def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
-
-        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1],-1, 2)) 
-    
-        freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2) 
-    
-        x_rotated = x_complex * freqs_complex
-    
-        x_out = torch.view_as_real(x_rotated)
-        x_out = x_out.reshape(*x.shape)
-        return x_out.type_as(x).to(device)
-
-
+import time
 
 
 class LayerNorm(nn.Module):
@@ -88,6 +29,7 @@ class LayerNorm(nn.Module):
         
 
         return y4
+
 
 
 class Embed(nn.Module):
@@ -111,7 +53,6 @@ class Embed(nn.Module):
         return allBatches
 
 
-
 class RopeAttention(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -132,12 +73,37 @@ class RopeAttention(nn.Module):
 
         self.f_C = None
 
+
+
         self.register_buffer("IGNORE", torch.tensor(-1e5, dtype=torch.float32, device="cuda"))
 
+
+    def precompute_theta_position_frequencies(head_dim : int, seq_len : int , device : str, theta : float = 10000.0):
+    
+        #Head_dimension must be even, since we split the head into pairs of real/imaginary numbers
+        assert head_dim % 2 == 0
+    
+        theta_numerator = torch.arange(0, head_dim, 2).float() #Creates array [0,2,4...d/2], i.e. shape still (head_dim / 2)
+        theta = 1.0 / (theta ** (theta_numerator / head_dim )).to(device) # Still (head_dim/2)
+        m = torch.arange(seq_len, device=device)
+        freqs = torch.outer(m, theta).float()    
+        freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_complex
+
+
+    def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
+
+        x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1],-1, 2))
+        freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2) 
+        x_rotated = x_complex * freqs_complex
+        x_out = torch.view_as_real(x_rotated)
+        x_out = x_out.reshape(*x.shape)
+        return x_out.type_as(x).to(device)
     
 
     def forward(self, normalized_resid_pre):
         # normalized_resid_pre: [batch, position, d_model]
+
         
         Q=einops.einsum(normalized_resid_pre, self.W_Q, 'b t c, n_heads c d_head -> b t n_heads d_head ') + self.b_Q
         K=einops.einsum(normalized_resid_pre, self.W_K, 'b t c, n_heads c d_head -> b t n_heads d_head ') + self.b_K
@@ -147,8 +113,8 @@ class RopeAttention(nn.Module):
         K=apply_rotary_embeddings(K, self.f_C, "cuda")
         
         qk_circuit = einops.einsum(Q, K, 'batch q n_head d_head, batch k n_head d_head -> batch n_head q k')
+
         qk_circuit = qk_circuit / math.sqrt(cfg.d_head)
-        
         masked = self.apply_causal_mask(qk_circuit)
         softmax = nn.Softmax(dim=3)
         soft = softmax(masked)
@@ -162,6 +128,7 @@ class RopeAttention(nn.Module):
         updated = torch.tril(attn_scores)
         updated[updated==0] = float('-inf')
         return updated
+
 
 
 class MLP(nn.Module):
@@ -200,7 +167,10 @@ class RopeBlock(nn.Module):
     def forward(self, resid_pre):
         # resid_pre [batch, position, d_model]
 
+        
+        
         norm_resid_pre = self.ln1(resid_pre)
+        self.attn.f_C = precompute_theta_position_frequencies(self.cfg.d_head, resid_pre.shape[1], "cuda", 10000)
         attended = self.attn(norm_resid_pre)
         resid_pre = resid_pre + attended
         norm_resid_mid = self.ln2(resid_pre)
@@ -209,7 +179,6 @@ class RopeBlock(nn.Module):
         
         
         return resid_pre
-
 
 
 class Unembed(nn.Module):
@@ -227,20 +196,18 @@ class Unembed(nn.Module):
 
 
 
-
 class RopeTransformer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.embed = Embed(cfg)
-        #self.pos_embed = PosEmbed(cfg)
         self.blocks = nn.ModuleList([RopeBlock(cfg) for _ in range(cfg.n_layers)])
         self.ln_final = LayerNorm(cfg)
         self.unembed = Unembed(cfg)
 
     def forward(self, tokens):
         # tokens [batch, position]
-
+        
 
         embedded = self.embed(tokens)
         expansion = self.blocks[0](embedded)
